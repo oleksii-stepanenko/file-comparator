@@ -1,0 +1,116 @@
+name: Build & Release
+
+# Build a .dmg on every tag (v1.0.0, …), attach it to the GitHub Release and
+# bump the Homebrew cask. Run it manually to get a downloadable build artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macOS runner: swift build + codesign + hdiutil; the cask bump uses BSD `sed -i ''`.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use the latest installed Xcode
+        run: sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+
+      - name: Derive version from tag
+        id: ver
+        run: |
+          # Tag builds use the tag (v1.2.3 -> 1.2.3); manual runs get 0.0.0.
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="0.0.0"
+          fi
+          echo "marketing=$VER" >> "$GITHUB_OUTPUT"
+          echo "Building version $VER (build ${GITHUB_RUN_NUMBER})"
+          swift --version
+
+      - name: Run tests
+        run: swift test
+
+      - name: Build the app
+        env:
+          FC_VERSION: ${{ steps.ver.outputs.marketing }}
+          FC_BUILD: ${{ github.run_number }}
+        run: ./Scripts/build.sh release
+
+      - name: Verify the bundle
+        run: |
+          set -euo pipefail
+          APP="build/FileComparator.app"
+          GOT="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          echo "CFBundleShortVersionString = $GOT"
+          [ "$GOT" = "${{ steps.ver.outputs.marketing }}" ] || {
+            echo "::error::Info.plist version $GOT != expected ${{ steps.ver.outputs.marketing }}"; exit 1; }
+          test -f "$APP/Contents/Resources/AppIcon.icns" || { echo "::error::AppIcon.icns missing"; exit 1; }
+          test -x "$APP/Contents/Resources/fcompare" || { echo "::error::fcompare missing"; exit 1; }
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Package .dmg
+        # The filename must match the `url` in the Homebrew cask.
+        run: |
+          set -euo pipefail
+          STAGE="dist/dmg"
+          mkdir -p "$STAGE"
+          cp -R "build/FileComparator.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "FileComparator" -srcfolder "$STAGE" \
+            -ov -format UDZO dist/FileComparator.dmg
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileComparator-dmg
+          path: dist/FileComparator.dmg
+
+      - name: Attach to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/FileComparator.dmg
+          generate_release_notes: true
+
+      - name: Bump Homebrew cask
+        # Cross-repo push needs a PAT with write access to homebrew-tap (the default
+        # GITHUB_TOKEN only covers this repo). Without the secret this step no-ops;
+        # bump by hand with packaging/bump-cask.sh instead.
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "::notice::No TAP_GITHUB_TOKEN secret — skipping cask bump. Run packaging/bump-cask.sh ${GITHUB_REF_NAME#v} locally."
+            exit 0
+          fi
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA="$(shasum -a 256 dist/FileComparator.dmg | awk '{print $1}')"
+          echo "Bumping cask to ${VERSION} (sha256 ${SHA})"
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/oleksii-stepanenko/homebrew-tap.git" tap
+          CASK="tap/Casks/file-comparator.rb"
+          if [ ! -f "$CASK" ]; then
+            echo "::error::$CASK not found in the tap. Copy packaging/homebrew/file-comparator.rb into the tap first."
+            exit 1
+          fi
+          sed -i '' -E "s/^  version \".*\"/  version \"${VERSION}\"/" "$CASK"
+          sed -i '' -E "s/^  sha256 \".*\"/  sha256 \"${SHA}\"/" "$CASK"
+          cd tap
+          if git diff --quiet; then
+            echo "Cask already at ${VERSION} — nothing to do."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -aqm "file-comparator ${VERSION}"
+          git push -q
+          echo "Cask bumped to ${VERSION}."
